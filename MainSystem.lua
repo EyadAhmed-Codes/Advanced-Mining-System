@@ -1,0 +1,578 @@
+--------------------------------------------| Notes |-------------------------------------------
+--|    -This script was made by @eyado2122_1 on roblox, or ID: hehe_boiaguy#1321 on discord (Don't mind the username lol)
+--|         > Core mining system scripted entirely by Eyad Ahmed (@eyado2122_1 on roblox)    
+--|         > This script intentionally avoids ModuleScripts to keep all related mining      
+--|            logic auditable in one place (for application).                               
+--|         - Pickaxe name is expected to be "Iron Pickaxe", "Gold Pickaxe", etc..           
+--|		    - Ore model name is expected to be "IronOre", "GoldOre", etc..                   
+--|		    - Ore Drops must be a model and has 1 part/mesh named 'root'.                    
+--|		    - No animations are implemented here because a client script would be needed.    
+--|    -Design Goals:
+--|         - Prevent remote abuse and prompt spoofing
+--|         - Avoid race conditions during mining
+--|         - Maintain O(1) cooldown validation
+--|         - Avoid unnecessary replication
+--|         - Centralize ore state outside Instances
+--|         - Guarantee cleanup even under failure cases
+--|    
+--|    -Architecture:
+--|         - OreState: Tracks all active ores using sequential IDs
+--|         - World: Manages spawn slot allocation
+--|         - CooldownManager: Uses absolute timestamps to prevent drift
+--|         - Attributes: Used for debug visibility and future UI integration
+--|    
+--|    -Modules:
+--|    		- Validation Layer
+--|    		- Ore State Management
+--|   		- Cooldown System
+--|   		- Spawn Allocation
+--|   		- Rarity Distribution
+--|   		- Cleanup Pipeline
+--|    
+--|   	-All validation is server-side.
+------------------------------------------------------------------------------------------------
+--// Services
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
+local Debris = game:GetService("Debris")
+
+--// References
+local ServerAssets = ServerStorage:WaitForChild("Assets") --// Server storage for assets
+
+local OreTemplates = ServerAssets:WaitForChild("OreModels")   --// Folder with ore models
+local OreDropTemplates = ServerAssets:WaitForChild("OreDrops") --// Folder with ore drop templates
+local OreSpawnLocations = workspace:WaitForChild("OreSpawnLocations"):GetChildren() --// Folder with spawn locations for ores
+local OresTools_Folder = ServerAssets:WaitForChild("OresTools") --// Folder to store tools for ores  (Tools are created dynamically!)
+
+--// Tables
+local OresByRarity = {}
+-- Settings are centralized here to make system balancing adjustable
+-- without touching core mining logic. This prevents variables
+-- from being scattered across the script.
+local Settings = {
+	SpawnOreCooldown = 3      -- Spawn Ore every ... seconds
+	,MaxDistanceToOre = 10    -- Maximum distance that the ore can be from the player to be mined (ProximityPrompt range and distance checks)
+	,MaxOres = 10             -- Maximum number of ores that can be spawned at once
+	,OreDespawnTime = 50      -- Despawn ore after ... seconds (if mined, cooldown will reset)
+	,OreDropsDespawnTime = 60 -- Despawn ore drops after ... seconds (if not picked up) 
+	,MaxPickupDistance = 10   -- Maximum distance that the player can be from the ore to pick up drops (ProximityPrompt range and distance checks)
+}
+-----------------------------
+-------- Ore Config ---------
+-----------------------------
+local RarityChances = {    --// Chance of each rarity to spawn
+	VeryCommon = 50,
+	Common = 30,
+	Uncommon = 15,
+	Rare = 4,
+	VeryRare = 1,
+}
+-- OreData acts as a single source of truth for all ore balancing. No gameplay values are 
+-- hardcoded outside this table.
+-- This makes adding new ores scale without changing system logic.
+local OreData = {
+	["Copper"] = {
+		Health = 50              -- Health of the ore
+		,CashReward = 5          -- Amount of money the player gets for mining this ore
+		,DropAmount = 3          -- Amount of ores that the ore drops when mined
+		,ModelName = "CopperOre" -- Name of the ore model in ReplicatedStorage.OreAssets
+		,Rarity = "VeryCommon"   -- Rarity of the ore
+		,MinRequiredTier = 1     -- Minimum Required tier to mine this ore
+	}
+	,["Iron"] = {
+		Health = 100
+		,CashReward = 10
+		,DropAmount = 2
+		,ModelName = "IronOre"
+		,Rarity = "Common"
+		,MinRequiredTier = 1
+	}
+	,["Gold"] = {
+		Health = 200
+		,CashReward = 25
+		,DropAmount = 1
+		,ModelName = "GoldOre"
+		,Rarity = "Uncommon"
+		,MinRequiredTier = 2
+	}
+}
+
+-----------------------------
+------ Pickaxe Config -------
+-----------------------------
+local PickaxesData = {
+	["Wooden Pickaxe"] = {
+		Damage = 25
+		,Cooldown = 3
+		,Tier = 1
+	}
+	,["Iron Pickaxe"] = {
+		Damage = 40
+		,Cooldown = 2.5
+		,Tier = 2
+	}
+}
+-----------------------------
+------ Debug and info -------
+-----------------------------
+local LOG_LEVEL = {
+	Debug = false,  --// set false if in production
+	Info = true,
+	Security = true,
+	Warn = true,
+	Error = true,
+}
+
+--// Debug / Logging Utility
+local function Debug_Print(Level:"Debug" | "Info" | "Security" | "Warn" | "Error", Message:string, Context)
+	if not LOG_LEVEL[Level] then -- Check in LOG_LEVEL if logs should be shown or not
+		return
+	end
+
+	local prefix = "[Mining]["..Level.."]"
+	local output = prefix .. " " .. tostring(Message)
+
+	if Context ~= nil and typeof(Context) == "table" then 
+		local Str = ""
+		for key, value in pairs(Context) do
+			Str ..= "\n      > "..tostring(key).." = "..tostring(value)
+		end
+		output ..= "\n Context: " .. tostring(Str) 
+	end
+	if Level == "Error" then                           
+		error(output)
+	elseif Level == "Warn" then 
+		warn(output)
+	else
+		print(output)
+	end
+end
+
+-----------------------------
+-------- Player Init --------
+-----------------------------
+local LeaderboardValues = {
+	Cash = {DefaultValue = 0, Type = "IntValue"},
+}
+Players.PlayerAdded:Connect(function(player)
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = player
+	for statName, Data in pairs(LeaderboardValues) do
+		local stat
+		local success,_ = pcall(function()
+			stat = Instance.new(Data.Type)
+		end)
+		if success then	
+			stat.Name = statName
+			stat.Value = Data.DefaultValue
+			stat.Parent = leaderstats
+		else
+			Debug_Print("Warn","Please set a valid instance type for leaderstat value '"..(statName or "nil").."'!", {DataType = Data.Type or "nil"})
+			return
+		end
+	end
+end)
+
+-----------------------------
+------ Cooldown Manager -----
+-----------------------------
+local CooldownManager = {
+	Players = {} -- [Player] = nextAllowedTime
+}
+-- Server time is used instead of tick() to prevent desync issues caused by lag or client-side time differences
+function CooldownManager:CanMine(Player)
+	local now = workspace:GetServerTimeNow() 
+	if not self.Players[Player] then   -- First time player using CooldownManager:CanMine, so
+		return true                    -- return true (can mine)
+	end
+	return now >= self.Players[Player] -- Comparing absolute timestamps avoids edge cases where cooldowns
+									   -- could be bypassed if the server lags or frame timing fluctuates
+end
+
+function CooldownManager:StartCooldown(Player, Cooldown)
+	self.Players[Player] = workspace:GetServerTimeNow() + Cooldown -- Store absolute timestamp instead of remaining time
+																   -- This avoids drift and allows O(1) cooldown validation
+end
+
+Players.PlayerRemoving:Connect(function(Player) -- Cooldown data is cleared on PlayerRemoving to prevent memory leaks
+	if CooldownManager.Players[Player] then
+		CooldownManager.Players[Player] = nil
+	end
+end)
+
+-----------------------------
+--------- Ore State --------- -- Centralized state table used instead of Instances to avoid unnecessary replication and improve server-side control
+----------------------------- -- OreState is intentionally separate from Instances. This avoids relying on workspace traversal
+							  -- and allows constant-time ore lookup by ID.
+local OreState = { -- Ore IDs are generated sequentially to guarantee uniqueness without relying on Instance:GetDebugId()
+	ByID = {} -- [OreID] -> Ore
+	,NextID = 0
+	,SpawnedOres = 0 --// Number of spawned ores
+}
+
+function OreState:AddOre(Ore:Model)
+	OreState.NextID += 1       -- Increment the next ID
+	OreState.SpawnedOres += 1  -- Increment the spawned ores count
+	local OreID = OreState.NextID 
+	OreState.ByID[OreID] = Ore -- Store the ore with its ID 
+	Ore:SetAttribute("OreID", OreID)
+	return OreID
+end
+
+function OreState:RemoveOre(OreID) -- Removing both the counter and ID entry keeps OreState consistent,
+								   -- preventing desync between actual instances and tracked state
+	OreState.SpawnedOres -= 1
+	OreState.ByID[OreID] = nil
+end
+
+-----------------------------
+-------- World Data ---------	-- World handles spatial spawn allocation.
+-----------------------------	-- Separation from OreState prevents logical coupling
+								-- between instance tracking and spawn management.
+local World = {
+	AvailableSlots = {} --// List of spawn available locations for ores  (dynamic)
+	,TakenSlots = {}    --// List of taken spawn locations for ores (dynamic)
+}
+--// Get A Random Spawn Location (For OreID)
+--// OreID: number
+function World:GetRandomSpawnSlot(OreID) -- Random index selection ensures uniform distribution
+										 -- while keeping slot allocation O(1)
+	local Index = math.random(1, #World.AvailableSlots)
+	local ChosenSlot = World.AvailableSlots[Index]
+	if ChosenSlot then
+		ChosenSlot.SpawnedOre = OreID
+		table.insert(World.TakenSlots, ChosenSlot) --// Store the taken slot
+		table.remove(World.AvailableSlots, Index) --// Remove the slot from available slots
+	end
+	return ChosenSlot
+end
+
+function World:RemoveFromSlot(OreID) -- Spawn slot is freed to prevent dead slots after ore removal
+	for Index, Slot in pairs(World.TakenSlots) do -- search for slot with OreID
+		if Slot.SpawnedOre == OreID then
+			Slot.SpawnedOre = nil
+			-- Return slot back to AvailableSlots so future ores
+			-- can reuse this location without overlapping
+			table.insert(World.AvailableSlots, Slot)
+			table.remove(World.TakenSlots, Index)
+			return
+		end
+	end
+end
+
+-----------------------------
+--------- Functions ---------
+-----------------------------
+--// Safely delete ore
+--// OreID: number
+--// Order: boolean. Default: false. (if true, it will delete the ore, if false, will check for TimeSinceLastMined.
+--// true should be used when you want to delete the ore, and false should be used for despawning logic)
+local function DeleteOre(OreID, Order:boolean)	-- DeleteOre centralizes all cleanup logic.
+												-- No ore is destroyed directly outside this function,
+												-- ensuring slot state and OreState remain consistent.
+	local Ore = OreState.ByID[OreID]
+	if Ore then
+		local LastMined = Ore:GetAttribute("LastMined")
+		if not Order and LastMined then -- Prevent ores from despawning while actively being mined
+										-- unless an explicit deletion order is issued.
+										-- This avoids resetting the despawn timer on every hit
+										-- while still allowing active mining to block deletion.
+			local TimeSinceLastMined = workspace:GetServerTimeNow() - LastMined
+			if TimeSinceLastMined < Settings.OreDespawnTime then
+				task.delay(Settings.OreDespawnTime, function()	-- Recursive delayed check ensures ores only despawn
+																-- after being inactive for the full despawn duration
+					DeleteOre(OreID, false)                     
+				end)
+				return
+			end
+		end
+		Ore:Destroy()
+		World:RemoveFromSlot(OreID)
+		OreState:RemoveOre(OreID)
+	end	
+end
+--// Register an ore
+--// Use this function to register a new ore, will add health, ID, etc...
+--// Ore: Model
+local function RegisterOre(Ore:Model)
+	local OreID = OreState:AddOre(Ore)
+	Ore:SetAttribute("LastMined", workspace:GetServerTimeNow())   -- Initialize LastMined immediately so newly spawned ores
+																  -- participate correctly in despawn timing logic
+	task.delay(Settings.OreDespawnTime, function()
+		DeleteOre(OreID, false)
+	end)
+	return OreID
+end
+--// Randomly select a Rarity
+--// Returns a string of the rarity
+local function GetRandomRarity() -- Weighted random selection ensures rarer ores appear less frequently without hardcoding spawn limits
+	local total = 0
+	for _, chance in pairs(RarityChances) do total += chance end
+	local RandomNumber = math.random(1,total)
+	local cumulative = 0
+	for rarity, chance in pairs(RarityChances) do
+		cumulative += chance
+		if RandomNumber <= cumulative then return rarity end
+	end
+	return "VeryCommon"
+end
+------------------------------------| Game Initialization |------------------------------------
+-- Init performs one-time system bootstrapping:
+-- - Builds rarity lookup table
+-- - Registers spawn slots
+-- - Generates dynamic ore tools
+-- - Sanitizes spawn location visibility
+local function Init()
+	--// Init OreRarityTable
+	local OreRarityTable = OresByRarity
+	for oreName, oreInfo in pairs(OreData) do
+		if not OreRarityTable[oreInfo.Rarity] then -- Ore rarity group doesn't exist?
+			OreRarityTable[oreInfo.Rarity] = {} -- Create rarity group
+		end
+		table.insert(OreRarityTable[oreInfo.Rarity], oreName)
+	end
+
+	--// Init OreSpawnLocations
+	for Index, SpawnLocation in pairs(OreSpawnLocations) do
+		table.insert(World.AvailableSlots, {['SpawnLocation'] = SpawnLocation, SpawnedOre = nil})
+	end
+	
+	--// Make Tools for ore
+	-- Tools are generated dynamically from drop templates
+	-- to prevent manual duplication and reduce maintenance overhead.
+	for _, Ore in pairs(OreDropTemplates:GetChildren()) do
+		local OreClone = Ore:Clone()
+		local OreTool = Instance.new("Tool")
+		local root = OreClone:FindFirstChild("root")
+		if not root then 
+			Debug_Print("Warn","Ore model " .. Ore.Name .. " is missing a 'root' part!")
+			Debug_Print("Warn","Ore Drop must be a model, has 1 part/mesh named 'root'")
+			continue
+		end
+		root.Name = "Handle"
+		root.Anchored = false
+		root.Parent = OreTool
+		root.CanCollide = false
+		root.Massless = true
+		OreClone:Destroy()
+		
+		OreTool.Name = Ore.Name
+		OreTool.RequiresHandle = true
+		OreTool.CanBeDropped = false
+		OreTool.Parent = OresTools_Folder
+	end
+	
+	--// Hide Spawn locations
+	for _, SpawnLocation in pairs(OreSpawnLocations) do
+		SpawnLocation.Transparency = 1
+		SpawnLocation.CanCollide = false
+	end
+end
+local Success, ErrorMsg = pcall(Init)
+if not Success then
+	Debug_Print("Error","Initialization Failed!", {ErrorMessage = ErrorMsg})
+end
+-----------------------------------------------------------------------------------------------
+--// Drop ores at the ore's position
+--// Player: Player that will own the ores
+--// Ore: Ore model
+local function DropOres(Player:Player, Ore:Model) -- DropOres is called only after successful ore destruction.
+												  -- Ownership is embedded into drops to prevent multiplayer exploitation.
+	local Data_ForOre = OreData[Ore.Name:split("Ore")[1]]
+	local OreDropTemplate = OreDropTemplates[Ore.Name]
+	if not OreDropTemplate then 
+		Debug_Print("Warn","No Ore Drop Template found in 'OreDropTemplate' folder \nConsider adding a model for this ore", {OreName = Ore.Name})
+		return 
+	end
+	
+	for i = 1, Data_ForOre.DropAmount do
+		local DropOre_Clone = OreDropTemplate:Clone()
+		-- Small random offset prevents stacked drops which could
+		-- cause physics jitter or make individual pickups unreadable
+		local Position = Ore.PrimaryPart.Position + Vector3.new(math.random(2,5), math.random(2,5), math.random(2,5)) 
+		DropOre_Clone.Parent = workspace
+		DropOre_Clone.root.CanCollide = true -- Enable physics interaction so dropped ores behave
+		DropOre_Clone.root.Anchored = false  -- like real world items and are visually readable
+		DropOre_Clone:PivotTo(CFrame.new(Position))
+		
+		DropOre_Clone:SetAttribute("Owner", Player.UserId)
+		DropOre_Clone:SetAttribute("PickedUp", false)
+
+		
+		local pp = Instance.new("ProximityPrompt")
+		pp.Parent = DropOre_Clone.root
+		pp.ActionText = "Pick Up"
+		pp.ObjectText = Ore.Name:split("Ore")[1]
+		pp.RequiresLineOfSight = false
+		pp.HoldDuration = 0.1
+		pp.KeyboardKeyCode = Enum.KeyCode.F
+		pp.MaxActivationDistance = Settings.MaxPickupDistance
+		
+		pp.Triggered:Connect(function(Player) -- Prompt validation is fully server-side. Even if client triggers the prompt remotely,
+										      -- distance and ownership are validated.
+			if DropOre_Clone:GetAttribute("PickedUp") then return end
+			if DropOre_Clone:GetAttribute("Owner") ~= Player.UserId then return end -- Ownership validation prevents other players from
+			    																	-- stealing drops via prompt spoofing or lag abuse
+			if not Player.Character or not Player.Character:FindFirstChild("HumanoidRootPart") then
+				Debug_Print("Debug", "Player has no character or humanoid root part", {UserId = Player.UserId})
+				return 
+			end
+			-- Distance is rechecked server-side to prevent exploiters from triggering prompts remotely
+			local Distance = (Player.Character.HumanoidRootPart.Position - DropOre_Clone.root.Position).Magnitude
+			if Distance > Settings.MaxPickupDistance + 2 then -- Small buffer accounts for character movement and latency
+															  -- without meaningfully expanding the allowed pickup range
+				Debug_Print("Security", "Player is too far from prompt", {UserId = Player.UserId, DistanceFromOre = Distance})
+				return
+			end
+			DropOre_Clone:SetAttribute("PickedUp", true)
+			DropOre_Clone:Destroy()
+			local OreTool = OresTools_Folder:FindFirstChild(Ore.Name)
+			if not OreTool then return end
+			OreTool:Clone().Parent = Player.Backpack
+		end)
+		
+		Debris:AddItem(DropOre_Clone, Settings.OreDropsDespawnTime) -- Debris is used instead of manual cleanup to guarantee
+																	-- removal even if references are lost or script errors
+	end
+end
+
+--// Mine Ore
+--// Use this function to mine an ore, after checking pickaxe equipped, cooldown, etc...
+--// Player: Player mining the ore
+--// OreID: number
+--// PickaxeData: table
+local function MineOre(Player:Player, OreID:number, PickaxeData) -- MineOre contains all mining validation logic.
+																 -- This prevents mining behavior from being duplicated
+																 -- across multiple event connections.
+	local Ore:Model = OreState.ByID[OreID]
+	if not Ore then return end
+	if not Player.Character or not Player.Character:FindFirstChild("HumanoidRootPart") then 
+		Debug_Print("Debug", "Player has no character or humanoid root part", {UserId = Player.UserId})
+		return 
+	end
+	-- Distance is rechecked server-side to prevent exploiters from triggering prompts remotely
+	local Distance = (Player.Character.HumanoidRootPart.Position - Ore.PrimaryPart.Position).Magnitude
+	if Distance > Settings.MaxDistanceToOre + 2 then
+		Debug_Print("Security", "Player is too far from prompt", {UserId = Player.UserId, DistanceFromOre = Distance})
+		return 
+	end
+	local Health = Ore:GetAttribute("OreHealth")
+	local MaxHealth = Ore:GetAttribute("OreMaxHealth")
+	local NewHealth = math.max(0, Health - PickaxeData.Damage) -- Clamp health to zero to avoid negative values,
+															   -- which would break UI and despawn logic
+	if NewHealth == 0 then
+		if Player:FindFirstChild("leaderstats") and Player.leaderstats:FindFirstChild("Cash") then --Make sure leaderstats and cash exists
+			Player.leaderstats.Cash.Value += OreData[Ore.Name:split("Ore")[1]].CashReward
+			DropOres(Player, Ore)
+		else
+			Debug_Print("Warn","Please make sure players has a 'Cash' of type: IntValue in leaderstats!")
+		end
+		DeleteOre(OreID, true)
+		return
+	else
+		Ore.Root:FindFirstChild("ProximityPrompt").ObjectText = Ore.Name .. "("..NewHealth.."/"..MaxHealth..")"
+	end
+	Ore:SetAttribute("OreHealth", NewHealth)
+	Ore:SetAttribute("LastMined", workspace:GetServerTimeNow()) -- Update activity timestamp so the ore is not
+																-- despawned while actively being mined
+end
+--// Attempt to spawn an ore
+local function AttemptToSpawnOre() -- AttemptToSpawnOre is intentionally isolated
+								   -- to keep spawning logic separate from mining logic.
+								   -- This improves readability and maintainability.
+	local RandomRarity = GetRandomRarity()
+	local OreRarityTable = OresByRarity
+	local OresList = OreRarityTable[RandomRarity]
+	if not OresList then return end --[[There is no Ore with Rarity 'RandomRarity']]
+	local RandomOre = OresList[math.random(1, #OresList)]
+	local OreData_ForOre = OreData[RandomOre]
+
+	local OreName = RandomOre.."Ore"
+	local OreTemplate = OreTemplates:FindFirstChild(OreName)
+	if not OreTemplate then 
+		Debug_Print("Warn","There is no Ore named '".. OreName .."' found in OreTemplates! \nPlease add your model for this ore in OreTemplates folder.", {OreName = OreName})
+		return
+	end
+	local Ore:Model = OreTemplate:Clone()
+	Ore.Parent = workspace
+	local PrimaryPart = Ore.PrimaryPart
+	if not PrimaryPart then
+		Debug_Print("Warn","Ore model '".. OreName .."' has no set PrimaryPart \nPlease set a PrimaryPart for your Ore model(s).", {OreName = OreName})
+		return
+	end
+	local OreID = RegisterOre(Ore)
+	local SpawnSlot = World:GetRandomSpawnSlot(OreID)
+	if not SpawnSlot then 
+		Debug_Print("Warn","No available spawn locations!")
+		Debug_Print("Warn","Consider increasing the number of spawn locations or decreasing the number of maximum spawnable ores in settings.")
+		return
+	end
+	local BaseCFrame = SpawnSlot.SpawnLocation.CFrame
+	local RandomAngle = math.rad(math.random(0, 360))
+
+	Ore:PivotTo(
+		BaseCFrame * CFrame.Angles(0, RandomAngle, 0)
+	)
+	local Ore_Health = OreData_ForOre.Health
+	Ore:SetAttribute("OreHealth", Ore_Health) -- Health and MaxHealth are stored as an attribute to allow easy debugging and future UI integration
+	Ore:SetAttribute("OreMaxHealth", Ore_Health)
+
+	local Prompt = Instance.new("ProximityPrompt")
+	Prompt.Parent = PrimaryPart
+	Prompt.ActionText = "Mine"
+	Prompt.ObjectText = OreName .. "("..Ore_Health.."/"..Ore_Health..")"
+	Prompt.RequiresLineOfSight = false
+	Prompt.HoldDuration = 0
+	Prompt.MaxActivationDistance = Settings.MaxDistanceToOre
+	Prompt.Triggered:Connect(function(Player)
+		--// Check if player has a pickaxe equipped
+		local EquippedTool = Player.Character:FindFirstChildOfClass("Tool")
+		-- Checks intentionally fail silently to avoid revealing internal validation logic to exploiters
+		if not EquippedTool then return end
+		if EquippedTool.Name:split(" ")[2] ~= "Pickaxe" then return end
+
+		if Ore:GetAttribute("Owner") then --// Check if ore is already 'claimed'
+			if Ore:GetAttribute("Owner") ~= Player.UserId then return end
+		end
+		Ore:SetAttribute("Owner",  Player.UserId)
+		-- Ownership is locked to the first miner to prevent multi-player race conditions
+		-- and reward duplication when multiple prompts trigger simultaneously
+
+		local Data = PickaxesData[EquippedTool.Name]
+		if not Data then 
+			Debug_Print("Warn","No pickaxe data found in 'PickaxesData' for pickaxe '".. EquippedTool.Name .."'!\nConsider adding data for this pickaxe or remove it.")
+			return 
+		end
+		if not CooldownManager:CanMine(Player) then 
+			return
+		end
+
+		if Data.Tier < OreData_ForOre.MinRequiredTier then
+			Debug_Print('Debug','Your pickaxe is too weak to mine this ore', {["Player"] = Player, ['PickaxeTier'] = Data.Tier, ['OreTier'] = OreData_ForOre.MinRequiredTier})
+			return 
+		end
+		Prompt.Enabled = false -- Disable prompt globally to prevent concurrent triggered events from corrupting ore state
+		task.delay(Data.Cooldown, function()
+			Prompt.Enabled = true
+		end)
+		CooldownManager:StartCooldown(Player, Data.Cooldown)
+
+		MineOre(Player, OreID, Data)
+	end)
+end	
+
+task.spawn(function()
+	while true do
+		task.wait(Settings.SpawnOreCooldown) 
+
+		-- SpawnedOres acts as a global cap to prevent uncontrolled ore growth,
+		-- which protects both server performance and spawn slot consistency
+		if OreState.SpawnedOres >= Settings.MaxOres then --// Max ores spawned?
+			continue       --// skip spawning a new ore
+		end
+
+		AttemptToSpawnOre()
+	end
+end)
