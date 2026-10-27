@@ -53,6 +53,7 @@ local OresByRarity = {}
 -- Settings are centralized here to make system balancing adjustable
 -- without touching core mining logic. This prevents variables
 -- from being scattered across the script.
+-- Keep tuning values separate from behavior so balance changes do not require editing the mining flow.
 local Settings = {
 	SpawnOreCooldown = 3      -- Spawn Ore every ... seconds
 	,MaxDistanceToOre = 10    -- Maximum distance that the ore can be from the player to be mined (ProximityPrompt range and distance checks)
@@ -128,6 +129,7 @@ local LOG_LEVEL = { --// Used to determine whether the log category is printed o
 }
 
 --// Debug / Logging Utility
+-- A single logging entry point keeps message formatting and log-level filtering consistent.
 local function Debug_Print(Level:"Debug" | "Info" | "Security" | "Warn" | "Error", Message:string, Context)
 	if not LOG_LEVEL[Level] then -- Check in LOG_LEVEL if logs should be shown or not
 		return
@@ -158,6 +160,7 @@ end
 local LeaderboardValues = {
 	Cash = {DefaultValue = 0, Type = "IntValue"},
 }
+-- Build leaderstats on the server so the displayed cash value is not controlled by the client.
 Players.PlayerAdded:Connect(function(player) --When player joins
 	local leaderstats = Instance.new("Folder") --Create leaderstats
 	leaderstats.Name = "leaderstats"
@@ -181,6 +184,7 @@ end)
 -----------------------------
 ------ Cooldown Manager -----
 -----------------------------
+-- Store each player's next allowed mining timestamp; checking it does not require scanning a list.
 local CooldownManager = {
 	Players = {} -- [Player] = nextAllowedTime
 }
@@ -209,6 +213,7 @@ end)
 --------- Ore State --------- -- Centralized state table used instead of Instances to avoid unnecessary replication and improve server-side control
 ----------------------------- -- OreState is intentionally separate from Instances. This avoids relying on workspace traversal
 -- and allows constant-time ore lookup by ID.
+-- This registry is the authoritative lookup for live ores, so later events can address an ore by ID.
 local OreState = { -- Ore IDs are generated sequentially to guarantee uniqueness without relying on Instance:GetDebugId()
 	ByID = {} -- [OreID] -> Ore
 	,NextID = 0
@@ -234,6 +239,7 @@ end
 -------- World Data ---------	-- World handles spatial spawn allocation.
 -----------------------------	-- Separation from OreState prevents logical coupling
 -- between instance tracking and spawn management.
+-- A slot belongs to exactly one of these lists: available for spawning or currently occupied.
 local World = {
 	AvailableSlots = {} --// List of spawn available locations for ores  (dynamic)
 	,TakenSlots = {}    --// List of taken spawn locations for ores (dynamic)
@@ -272,6 +278,7 @@ end
 --// OreID: number
 --// Order: boolean. Default: false. (if true, it will delete the ore, if false, will check for TimeSinceLastMined.
 --// true should be used when you want to delete the ore, and false should be used for despawning logic)
+-- All removal paths go through this function so the model, ID registry, and spawn slot are cleaned together.
 local function DeleteOre(OreID, Order:boolean)	-- DeleteOre centralizes all cleanup logic.
 	-- No ore is destroyed directly outside this function,
 	-- ensuring slot state and OreState remain consistent.
@@ -299,6 +306,7 @@ end
 --// Register an ore
 --// Use this function to register a new ore, will add health, ID, etc...
 --// Ore: Model
+-- Register before scheduling despawn so the ore has an ID that every later cleanup callback can use.
 local function RegisterOre(Ore:Model)
 	local OreID = OreState:AddOre(Ore)
 	Ore:SetAttribute("LastMined", workspace:GetServerTimeNow())   -- Initialize LastMined immediately so newly spawned ores
@@ -310,6 +318,7 @@ local function RegisterOre(Ore:Model)
 end
 --// Randomly select a Rarity
 --// Returns a string of the rarity
+-- Convert the configured weights into one selectable range, then map the random result back to a rarity.
 local function GetRandomRarity() -- Weighted random selection ensures rarer ores appear less frequently without hardcoding spawn limits
 	local total = 0
 	for _, chance in pairs(RarityChances) do total += chance end
@@ -327,6 +336,7 @@ end
 -- - Registers spawn slots
 -- - Generates dynamic ore tools
 -- - Sanitizes spawn location visibility
+-- Prepare all lookup tables and world resources once before the repeating spawn loop starts.
 local function Init()
 	--// Init OreRarityTable
 	local OreRarityTable = OresByRarity
@@ -381,6 +391,7 @@ end
 --// Drop ores at the ore's position
 --// Player: Player that will own the ores
 --// Ore: Ore model that will be dropped
+-- Create physical pickup instances only after a successful mine, and bind each pickup to its earning player.
 local function DropOres(Player:Player, Ore:Model) -- DropOres is called only after successful ore destruction.
 	-- Ownership is embedded into drops to prevent multiplayer exploitation.
 	local Data_ForOre = OreData[Ore.Name:split("Ore")[1]]
@@ -446,6 +457,7 @@ end
 --// Player: Player mining the ore
 --// OreID: number
 --// PickaxeData: table
+-- Revalidate the live ore, character, and distance at the point of damage rather than trusting the prompt alone.
 local function MineOre(Player:Player, OreID:number, PickaxeData) -- MineOre contains all mining validation logic.
 	-- This prevents mining behavior from being duplicated
 	-- across multiple event connections.
@@ -482,6 +494,7 @@ local function MineOre(Player:Player, OreID:number, PickaxeData) -- MineOre cont
 	-- despawned while actively being mined
 end
 --// Attempt to spawn an ore
+-- Select the ore first, then validate its template and spawn location before finishing its setup.
 local function AttemptToSpawnOre() 
 	-- AttemptToSpawnOre is intentionally isolated
 	-- to keep spawning logic separate from mining logic.
@@ -530,6 +543,7 @@ local function AttemptToSpawnOre()
 	Prompt.RequiresLineOfSight = false
 	Prompt.HoldDuration = 0
 	Prompt.MaxActivationDistance = Settings.MaxDistanceToOre
+		-- Treat prompt activation as a request, not proof that the player is allowed to mine this ore.
 	Prompt.Triggered:Connect(function(Player)
 		--// Check if player has a pickaxe equipped
 		local EquippedTool = Player.Character:FindFirstChildOfClass("Tool")
@@ -567,6 +581,7 @@ local function AttemptToSpawnOre()
 	end)
 end	
 
+-- Run spawning independently of player actions; the global cap prevents this loop from exceeding the configured limit.
 task.spawn(function()
 	while true do
 		task.wait(Settings.SpawnOreCooldown) 
